@@ -605,6 +605,70 @@ TEST(discover_generic_dirs_fast_mode) {
     PASS();
 }
 
+TEST(discover_fast_keeps_jvm_source_package_dirs) {
+    char *base = th_mktempdir("cbm_disc_jvm_package");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "example/ignored.go"), "package ignored\n");
+    th_write_file(TH_PATH(base, "src/main/java/com/example/RootApp.java"),
+                  "package com.example;\nclass RootApp {}\n");
+    th_write_file(TH_PATH(base, "src/main/java/com/example/tools/ToolApp.java"),
+                  "package com.example.tools;\nclass ToolApp {}\n");
+    th_write_file(TH_PATH(base, "src/main/java/com/example/integration/IntegrationApp.java"),
+                  "package com.example.integration;\nclass IntegrationApp {}\n");
+    th_write_file(TH_PATH(base, "src/main/java/com/example/generated/GeneratedApp.java"),
+                  "package com.example.generated;\nclass GeneratedApp {}\n");
+    th_write_file(TH_PATH(base, "src/test/java/com/example/RootAppTest.java"),
+                  "package com.example;\nclass RootAppTest {}\n");
+    th_write_file(TH_PATH(base, "services/order/src/main/java/com/example/App.java"),
+                  "package com.example;\nclass App {}\n");
+    th_write_file(TH_PATH(base, "services/order/src/test/java/com/example/AppTest.java"),
+                  "package com.example;\nclass AppTest {}\n");
+    th_write_file(TH_PATH(base, "src/integrationTest/java/com/example/tools/ItTool.java"),
+                  "package com.example.tools;\nclass ItTool {}\n");
+    th_write_file(TH_PATH(base, "legacy/src/java/com/example/generated/LegacyGenerated.java"),
+                  "package com.example.generated;\nclass LegacyGenerated {}\n");
+    th_write_file(TH_PATH(base, "tools/src/main/java/com/example/ToolModule.java"),
+                  "package com.example;\nclass ToolModule {}\n");
+    th_write_file(TH_PATH(base, "generated/src/test/java/com/example/GeneratedModuleTest.java"),
+                  "package com.example;\nclass GeneratedModuleTest {}\n");
+    th_write_file(TH_PATH(base, "integration/src/main/kotlin/com/example/IntegrationModule.kt"),
+                  "package com.example\nclass IntegrationModule\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FAST};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 12);
+    const char *expected[] = {
+        "src/main/java/com/example/RootApp.java",
+        "src/main/java/com/example/generated/GeneratedApp.java",
+        "src/main/java/com/example/integration/IntegrationApp.java",
+        "src/main/java/com/example/tools/ToolApp.java",
+        "src/test/java/com/example/RootAppTest.java",
+        "services/order/src/main/java/com/example/App.java",
+        "services/order/src/test/java/com/example/AppTest.java",
+        "src/integrationTest/java/com/example/tools/ItTool.java",
+        "legacy/src/java/com/example/generated/LegacyGenerated.java",
+        "tools/src/main/java/com/example/ToolModule.java",
+        "generated/src/test/java/com/example/GeneratedModuleTest.java",
+        "integration/src/main/kotlin/com/example/IntegrationModule.kt",
+    };
+    for (int i = 0; i < 12; i++) {
+        bool found = false;
+        for (int j = 0; j < count; j++) {
+            found = found || strcmp(files[j].rel_path, expected[i]) == 0;
+        }
+        ASSERT_TRUE(found);
+    }
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_cbmignore_no_git) {
     char *base = th_mktempdir("cbm_disc_nogit");
     ASSERT(base != NULL);
@@ -792,6 +856,7 @@ SUITE(discover) {
     RUN_TEST(discover_new_ignore_patterns);
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
+    RUN_TEST(discover_fast_keeps_jvm_source_package_dirs);
     RUN_TEST(discover_cbmignore_no_git);
 
     /* Nested .gitignore tests (issue #178) */

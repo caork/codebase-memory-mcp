@@ -131,6 +131,87 @@ static bool str_contains(const char *s, const char *sub) {
     return strstr(s, sub) != NULL;
 }
 
+static int wide_stat(const char *path, struct stat *st);
+
+static bool is_fast_skip_dir_name(const char *dirname) {
+    return str_in_list(dirname, FAST_SKIP_DIRS);
+}
+
+static bool path_has_segment(const char *rel_path, const char *segment) {
+    if (!rel_path || !segment || segment[0] == '\0') {
+        return false;
+    }
+    size_t seg_len = strlen(segment);
+    const char *cur = rel_path;
+    while (*cur) {
+        const char *next = strchr(cur, '/');
+        size_t len = next ? (size_t)(next - cur) : strlen(cur);
+        if (len == seg_len && strncmp(cur, segment, len) == 0) {
+            return true;
+        }
+        if (!next) {
+            break;
+        }
+        cur = next + 1;
+    }
+    return false;
+}
+
+static bool is_jvm_source_package_path(const char *rel_path) {
+    return path_has_segment(rel_path, "java") ||
+           path_has_segment(rel_path, "kotlin") ||
+           path_has_segment(rel_path, "scala") ||
+           path_has_segment(rel_path, "groovy");
+}
+
+static bool child_dir_exists(const char *base, const char *rel_path) {
+    if (!base || !rel_path) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/%s", base, rel_path);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    struct stat st;
+    return wide_stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool has_jvm_source_root_under(const char *abs_path) {
+    static const char *roots[] = {
+        "src/main/java",             "src/test/java",
+        "src/integrationTest/java",  "src/it/java",
+        "src/java",                  "java",
+        "src/main/kotlin",           "src/test/kotlin",
+        "src/integrationTest/kotlin", "src/it/kotlin",
+        "src/kotlin",                "kotlin",
+        "src/main/scala",            "src/test/scala",
+        "src/integrationTest/scala", "src/it/scala",
+        "src/scala",                 "scala",
+        "src/main/groovy",           "src/test/groovy",
+        "src/integrationTest/groovy", "src/it/groovy",
+        "src/groovy",                "groovy",
+        NULL,
+    };
+    if (!abs_path) {
+        return false;
+    }
+    for (int i = 0; roots[i]; i++) {
+        if (child_dir_exists(abs_path, roots[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool keep_fast_source_package_dir(const char *entry_name, const char *rel_path,
+                                         const char *abs_path, cbm_index_mode_t mode) {
+    if (mode == CBM_MODE_FULL || !entry_name || !rel_path || !is_fast_skip_dir_name(entry_name)) {
+        return false;
+    }
+    return is_jvm_source_package_path(rel_path) || has_jvm_source_root_under(abs_path);
+}
+
 /* ── Public filter functions ─────────────────────── */
 
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
@@ -272,10 +353,13 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
 
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
+                                  const char *abs_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix) {
-    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
+    cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
+    if (cbm_should_skip_dir(entry_name, mode) &&
+        !keep_fast_source_package_dir(entry_name, rel_path, abs_path, mode)) {
         return true;
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
@@ -452,7 +536,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (!should_skip_directory(entry->name, rel_path, opts, gitignore, cbmignore,
+        if (!should_skip_directory(entry->name, rel_path, abs_path, opts, gitignore, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
             walk_push_subdir(stack, top, abs_path, rel_path, frame);
         } else {
