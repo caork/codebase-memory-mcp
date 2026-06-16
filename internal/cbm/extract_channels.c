@@ -46,6 +46,11 @@ typedef struct {
     int count;
 } chan_const_table_t;
 
+typedef struct {
+    chan_const_t items[CHAN_CONST_CAP];
+    int count;
+} chan_receiver_table_t;
+
 /* ── String literal helpers ──────────────────────────────────────── */
 
 static const char *unquote_string(CBMArena *a, const char *s) {
@@ -171,6 +176,33 @@ static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tb
 /* Resolve an identifier against the constant table.  Returns NULL on miss. */
 static const char *resolve_identifier(const chan_const_table_t *tbl, const char *name) {
     if (!name) {
+        return NULL;
+    }
+    for (int i = 0; i < tbl->count; i++) {
+        if (tbl->items[i].name && strcmp(tbl->items[i].name, name) == 0) {
+            return tbl->items[i].value;
+        }
+    }
+    return NULL;
+}
+
+static void add_receiver(chan_receiver_table_t *tbl, const char *name, const char *transport) {
+    if (!tbl || !name || !transport || tbl->count >= CHAN_CONST_CAP) {
+        return;
+    }
+    for (int i = 0; i < tbl->count; i++) {
+        if (tbl->items[i].name && strcmp(tbl->items[i].name, name) == 0) {
+            tbl->items[i].value = transport;
+            return;
+        }
+    }
+    tbl->items[tbl->count].name = name;
+    tbl->items[tbl->count].value = transport;
+    tbl->count++;
+}
+
+static const char *resolve_receiver(const chan_receiver_table_t *tbl, const char *name) {
+    if (!tbl || !name) {
         return NULL;
     }
     for (int i = 0; i < tbl->count; i++) {
@@ -389,7 +421,69 @@ static void extract_channels_js(CBMExtractCtx *ctx) {
  *  Python — python-socketio, Django Channels, FastAPI WebSocket, Kafka
  * ══════════════════════════════════════════════════════════════════ */
 
-static const char *py_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) {
+static bool source_contains(CBMExtractCtx *ctx, const char *needle) {
+    return ctx && ctx->source && needle && strstr(ctx->source, needle) != NULL;
+}
+
+static bool source_has_python_kafka(CBMExtractCtx *ctx) {
+    return source_contains(ctx, "from kafka import") ||
+           source_contains(ctx, "from confluent_kafka import") ||
+           source_contains(ctx, "import kafka") || source_contains(ctx, "import confluent_kafka");
+}
+
+static bool source_has_python_pika(CBMExtractCtx *ctx) {
+    return source_contains(ctx, "import pika") || source_contains(ctx, "from pika import");
+}
+
+static bool source_has_python_nats(CBMExtractCtx *ctx) {
+    return source_contains(ctx, "import nats") || source_contains(ctx, "from nats");
+}
+
+static void scan_python_message_receivers(CBMExtractCtx *ctx, chan_receiver_table_t *tbl) {
+    if (!ctx || !tbl) {
+        return;
+    }
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
+
+    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "assignment") == 0) {
+            TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(node, TS_FIELD("right"));
+            if (!ts_node_is_null(left) && !ts_node_is_null(right) &&
+                strcmp(ts_node_type(left), "identifier") == 0) {
+                char *name = cbm_node_text(ctx->arena, left, ctx->source);
+                char *rhs = cbm_node_text(ctx->arena, right, ctx->source);
+                if (name && rhs) {
+                    if (source_has_python_kafka(ctx) &&
+                        (strstr(rhs, "KafkaProducer(") || strstr(rhs, "KafkaConsumer(") ||
+                         strstr(rhs, "Producer(") || strstr(rhs, "Consumer(") ||
+                         strstr(rhs, "kafka.KafkaProducer(") ||
+                         strstr(rhs, "kafka.KafkaConsumer(") ||
+                         strstr(rhs, "confluent_kafka.Producer(") ||
+                         strstr(rhs, "confluent_kafka.Consumer("))) {
+                        add_receiver(tbl, name, "kafka");
+                    } else if (source_has_python_pika(ctx) && strstr(rhs, ".channel(")) {
+                        add_receiver(tbl, name, "rabbitmq");
+                    } else if (source_has_python_nats(ctx) &&
+                               (strstr(rhs, "nats.connect(") || strstr(rhs, "Client(") ||
+                                strstr(rhs, "NATS("))) {
+                        add_receiver(tbl, name, "nats");
+                    }
+                }
+            }
+        }
+        uint32_t count = ts_node_child_count(node);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+        }
+    }
+}
+
+static const char *py_classify_receiver(CBMExtractCtx *ctx, TSNode object_node,
+                                        const chan_receiver_table_t *receivers) {
     char *text = cbm_node_text(ctx->arena, object_node, ctx->source);
     if (!text) {
         return NULL;
@@ -411,14 +505,7 @@ static const char *py_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) 
     if (strcmp(tail, "websocket") == 0 || strcmp(tail, "ws") == 0) {
         return "websocket";
     }
-    /* kafka-python */
-    if (strcmp(tail, "producer") == 0) {
-        return "kafka";
-    }
-    if (strcmp(tail, "consumer") == 0) {
-        return "kafka";
-    }
-    return NULL;
+    return resolve_receiver(receivers, tail);
 }
 
 /* Table-driven Python method→direction classification.
@@ -432,6 +519,11 @@ static const struct {
     {"kafka", "produce", CBM_CHANNEL_EMIT},
     {"kafka", "subscribe", CBM_CHANNEL_LISTEN},
     {"kafka", "poll", CBM_CHANNEL_LISTEN},
+    {"rabbitmq", "basic_publish", CBM_CHANNEL_EMIT},
+    {"rabbitmq", "basic_consume", CBM_CHANNEL_LISTEN},
+    {"rabbitmq", "consume", CBM_CHANNEL_LISTEN},
+    {"nats", "publish", CBM_CHANNEL_EMIT},
+    {"nats", "subscribe", CBM_CHANNEL_LISTEN},
     {"django_channels", "send", CBM_CHANNEL_EMIT},
     {"django_channels", "group_send", CBM_CHANNEL_EMIT},
     {"django_channels", "receive", CBM_CHANNEL_LISTEN},
@@ -463,7 +555,8 @@ static int py_classify_direction(const char *transport, const char *method) {
     return CHAN_DIR_UNKNOWN;
 }
 
-static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_table_t *consts) {
+static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_table_t *consts,
+                            const chan_receiver_table_t *receivers) {
     /* Python call: attribute { object, attribute }, argument_list */
     TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
     if (ts_node_is_null(func)) {
@@ -480,7 +573,7 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     }
 
     char *method = cbm_node_text(ctx->arena, attr, ctx->source);
-    const char *transport = py_classify_receiver(ctx, object);
+    const char *transport = py_classify_receiver(ctx, object, receivers);
     if (!transport || !method) {
         return;
     }
@@ -504,7 +597,8 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
 
 /* Detect Python decorator-based listeners: @sio.on("event") / @sio.event */
 static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
-                                 const chan_const_table_t *consts) {
+                                 const chan_const_table_t *consts,
+                                 const chan_receiver_table_t *receivers) {
     /* decorator: @expression or @call(args) */
     uint32_t nc = ts_node_named_child_count(decorator);
     if (nc == 0) {
@@ -528,7 +622,7 @@ static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
         if (!method || strcmp(method, "on") != 0) {
             return;
         }
-        const char *transport = py_classify_receiver(ctx, object);
+        const char *transport = py_classify_receiver(ctx, object, receivers);
         if (!transport) {
             return;
         }
@@ -546,7 +640,9 @@ static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
 
 static void extract_channels_python(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
+    chan_receiver_table_t receivers = {0};
     scan_string_consts_python(ctx, &consts);
+    scan_python_message_receivers(ctx, &receivers);
 
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
@@ -556,9 +652,9 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
         TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "call") == 0) {
-            py_process_call(ctx, node, &consts);
+            py_process_call(ctx, node, &consts, &receivers);
         } else if (strcmp(kind, "decorator") == 0) {
-            py_process_decorator(ctx, node, &consts);
+            py_process_decorator(ctx, node, &consts, &receivers);
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {

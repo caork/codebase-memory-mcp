@@ -142,6 +142,17 @@ static int et_edge_present(const EtFile *files, int nfiles, const char *edge, in
     return got >= floor;
 }
 
+static int et_edge_count_exact(const EtFile *files, int nfiles, const char *edge, int expected) {
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge) : -1;
+    if (got != expected) {
+        fprintf(stderr, "  [ET-EDGE] FAIL %-20s count=%d expected=%d\n", edge, got, expected);
+    }
+    et_cleanup(&lp, store);
+    return got == expected;
+}
+
 /* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
  * parallel pipeline path (MIN_FILES_FOR_PARALLEL = 50). */
 enum { ET_PARALLEL_PAD = 52, ET_PAD_MAX = 68 /* 52 pad + 16 meaningful */ };
@@ -671,6 +682,48 @@ TEST(async_calls_bullmq_js) {
          "function schedulePasswordReset(userId) {\n"
          "    return mailQueue.add('password-reset', { userId });\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
+    PASS();
+}
+
+TEST(native_channels_python_require_message_bindings) {
+    static const EtFile f[] = {
+        {"events.py",
+         "class Consumer:\n    pass\n\n"
+         "def business_names(producer, channel, nc):\n"
+         "    consumer = Consumer('orders.created')\n"
+         "    producer.send('orders.created', b'{}')\n"
+         "    channel.basic_consume(queue='orders.created')\n"
+         "    channel.basic_publish(exchange='orders.created', routing_key='orders.created')\n"
+         "    nc.subscribe('orders.created')\n"
+         "    nc.publish('orders.created', b'{}')\n"}};
+    ASSERT_TRUE(et_edge_count_exact(f, 1, "EMITS", 0));
+    ASSERT_TRUE(et_edge_count_exact(f, 1, "LISTENS_ON", 0));
+    PASS();
+}
+
+TEST(native_channels_python_import_bound_message_clients) {
+    static const EtFile f[] = {
+        {"events.py",
+         "from kafka import KafkaConsumer, KafkaProducer\n"
+         "from confluent_kafka import Producer\n"
+         "import pika\n"
+         "import nats\n\n"
+         "def consume():\n"
+         "    consumer = KafkaConsumer('orders.created')\n"
+         "    consumer.subscribe(['orders.updated'])\n\n"
+         "def publish():\n"
+         "    producer = KafkaProducer()\n"
+         "    producer.send('orders.created', b'{}')\n"
+         "    p = Producer({})\n"
+         "    p.produce('orders.updated', b'{}')\n\n"
+         "def rabbit(conn):\n"
+         "    ch = conn.channel()\n"
+         "    ch.basic_publish(exchange='orders.exchange', routing_key='orders.created')\n\n"
+         "async def nats_pub():\n"
+         "    client = await nats.connect('nats://localhost:4222')\n"
+         "    await client.publish('orders.created', b'{}')\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "EMITS", 3));
+    ASSERT_TRUE(et_edge_present(f, 1, "LISTENS_ON", 1));
     PASS();
 }
 
@@ -1373,6 +1426,8 @@ SUITE(edge_types_probe) {
     RUN_TEST(async_calls_kafkajs_ts);
     RUN_TEST(async_calls_sqs_go);
     RUN_TEST(async_calls_bullmq_js);
+    RUN_TEST(native_channels_python_require_message_bindings);
+    RUN_TEST(native_channels_python_import_bound_message_clients);
 
     /* THROWS — checked exceptions (7 languages, parallel path) */
     RUN_TEST(throws_java);
