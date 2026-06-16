@@ -404,7 +404,10 @@ const char *cbm_app_local_dir(void) {
 const char *cbm_resolve_cache_dir(void) {
     static char buf[CBM_SZ_1K];
     char tmp[CBM_SZ_256] = "";
-    cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
+    cbm_safe_getenv("AKA_ENGINE_CACHE_DIR", tmp, sizeof(tmp), NULL);
+    if (!tmp[0]) {
+        cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
+    }
     if (tmp[0]) {
         snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
@@ -414,6 +417,6 @@ const char *cbm_resolve_cache_dir(void) {
     if (!home) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(buf, sizeof(buf), "%s/.cache/aka-engine", home);
     return buf;
 }
